@@ -4,9 +4,11 @@ import {
   type AssistantCitation,
   type ScopedThreadRef,
 } from "@t3tools/contracts";
+import { useAtomValue } from "@effect/atom-react";
 import { QuoteIcon } from "lucide-react";
-import { use, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { use, useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { shortcutLabelForCommand } from "~/keybindings";
 import {
   captureAssistantTextSelection,
   type AssistantCitationSourceAnchor,
@@ -17,7 +19,10 @@ import {
   resolveSelectionActionPosition,
   type SelectionActionPoint,
 } from "~/lib/selectionActions";
+import { registerCommands } from "~/shortcuts/dispatcher";
+import { primaryServerKeybindingsAtom } from "~/state/server";
 import { Button } from "../ui/button";
+import { Kbd } from "../ui/kbd";
 import { BackgroundThreadContext } from "./backgroundThread";
 
 export function AssistantSelectionToolbar({
@@ -37,6 +42,7 @@ export function AssistantSelectionToolbar({
   const toolbarRef = useRef<HTMLButtonElement>(null);
   const actionsRef = useRef<ReturnType<typeof observeSelectionActions> | null>(null);
   const backgroundThread = use(BackgroundThreadContext);
+  const keybindings = useAtomValue(primaryServerKeybindingsAtom);
 
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- measures the toolbar DOM node and clamps its position inside the window before paint
   useLayoutEffect(() => {
@@ -176,18 +182,41 @@ export function AssistantSelectionToolbar({
     };
   }, [backgroundThread, threadRef, viewport]);
 
-  if (!selection) return null;
-  const tooLong = selection.citation.text.length > ASSISTANT_CITATION_MAX_TEXT_LENGTH;
+  const tooLong =
+    selection !== null && selection.citation.text.length > ASSISTANT_CITATION_MAX_TEXT_LENGTH;
   const dismiss = () => {
     actionsRef.current?.cancel();
     setSelection(null);
   };
   const cite = () => {
-    if (tooLong || !onCite(selection.citation, selection.sourceAnchor)) return false;
+    if (!selection || tooLong || !onCite(selection.citation, selection.sourceAnchor)) return false;
     window.getSelection()?.removeAllRanges();
     dismiss();
     return true;
   };
+  const citeFromShortcut = useEffectEvent(cite);
+  const hasSelection = selection !== null;
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- registers the cite shortcut only while a citable selection is showing
+  useEffect(() => {
+    if (!hasSelection || backgroundThread) return;
+    // Capture phase, so the focused composer or a message link does not take the chord first.
+    return registerCommands(
+      {
+        "chat.citeSelection": (event) => {
+          if (event.repeat || event.isComposing || !citeFromShortcut()) return false;
+          event.preventDefault();
+          event.stopPropagation();
+        },
+      },
+      { capture: true },
+    );
+  }, [backgroundThread, hasSelection]);
+
+  if (!selection) return null;
+  const shortcutLabel = backgroundThread
+    ? null
+    : shortcutLabelForCommand(keybindings, "chat.citeSelection");
   return createPortal(
     <Button
       ref={toolbarRef}
@@ -210,6 +239,7 @@ export function AssistantSelectionToolbar({
     >
       <QuoteIcon aria-hidden="true" className="size-3.5" />
       {tooLong ? "Shorten selection" : "Cite"}
+      {!tooLong && shortcutLabel ? <Kbd>{shortcutLabel}</Kbd> : null}
     </Button>,
     document.body,
   );
