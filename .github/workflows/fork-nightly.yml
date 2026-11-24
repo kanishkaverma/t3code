@@ -1,0 +1,386 @@
+name: Fork Nightly Release
+
+on:
+  schedule:
+    # Run every 6 hours off minute zero so fork builds track upstream/main automatically.
+    - cron: "17 */6 * * *"
+  push:
+    branches:
+      - fork
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Build and publish even if upstream/main and fork have not changed"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: fork-nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Check upstream & rebase
+    if: github.repository != 'pingdotgg/t3code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      upstream_sha: ${{ steps.check.outputs.upstream_sha }}
+      fork_sha: ${{ steps.check.outputs.fork_sha }}
+      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+      release_name: ${{ steps.check.outputs.release_name }}
+    steps:
+      - name: Checkout fork branch
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: fork
+          fetch-depth: 0
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Rebase onto upstream/main and resolve release metadata
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_STARTED_AT: ${{ github.run_started_at }}
+        run: |
+          set -euo pipefail
+          git config user.name "fork-nightly-bot"
+          git config user.email "fork-nightly-bot@users.noreply.github.com"
+
+          fork_sha="$(git rev-parse HEAD)"
+          git remote add upstream https://github.com/pingdotgg/t3code.git
+          git fetch --no-tags upstream main
+          upstream_sha="$(git rev-parse upstream/main)"
+
+          echo "fork_sha=$fork_sha" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+
+          if ! git rebase "$upstream_sha"; then
+            conflicts="$(git diff --name-only --diff-filter=U || true)"
+            git rebase --abort || true
+            echo "::error::Rebase of fork onto upstream/main ($upstream_sha) failed with conflicts in: $conflicts"
+            exit 1
+          fi
+
+          latest_body="$(gh api "repos/$GH_REPO/releases?per_page=20" \
+            --jq '[.[] | select(.draft == false and (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+-nightly\\.")))] | .[0].body // ""' \
+            2>/dev/null || true)"
+          marker="<!-- fork-build: upstream=${upstream_sha} fork=${fork_sha} -->"
+
+          if [[ "$FORCE_BUILD" != "true" && "$latest_body" == *"$marker"* ]]; then
+            echo "Already built upstream=${upstream_sha:0:7} + fork=${fork_sha:0:7}; skipping."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          base_version="$(node -p '
+            const v = require("./apps/desktop/package.json").version.replace(/[-+].*$/, "");
+            const [maj, min, patch] = v.split(".").map(Number);
+            `${maj}.${min}.${patch + 1}`;
+          ')"
+          nightly_date="$(date -u -d "$RUN_STARTED_AT" +%Y%m%d)"
+          version="${base_version}-nightly.${nightly_date}.${RUN_NUMBER}"
+          tag="v${version}"
+          release_name="T3 Code Nightly ${version} (fork)"
+
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release_name=$release_name" >> "$GITHUB_OUTPUT"
+          echo "Planned release: $tag (upstream=${upstream_sha:0:7}, fork=${fork_sha:0:7})"
+
+  build_mac_arm64:
+    name: Build, sign & publish (macOS arm64)
+    needs: [prepare]
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Verify signing secrets
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CSC_LINK:-}" || -z "${CSC_KEY_PASSWORD:-}" ]]; then
+            echo "::error::Missing CSC_LINK or CSC_KEY_PASSWORD secrets. macOS in-app auto-updates require signing with your Developer ID Application certificate."
+            exit 1
+          fi
+
+      - name: Checkout fork branch
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.prepare.outputs.fork_sha }}
+          fetch-depth: 0
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Rebase onto resolved upstream/main commit
+        shell: bash
+        env:
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "fork-nightly-bot"
+          git config user.email "fork-nightly-bot@users.noreply.github.com"
+          git remote add upstream https://github.com/pingdotgg/t3code.git
+          git fetch --no-tags upstream "$UPSTREAM_SHA"
+          git rebase "$UPSTREAM_SHA"
+
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Cache resource monitor
+        id: resource_monitor_cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: native/resource-monitor/target/aarch64-apple-darwin/release/t3-resource-monitor
+          key: fork-resource-monitor-aarch64-apple-darwin-${{ hashFiles('.cargo/config.toml', 'native/resource-monitor/Cargo.lock', 'native/resource-monitor/Cargo.toml', 'native/resource-monitor/src/**') }}
+
+      - name: Setup Rust
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+
+      - name: Build resource monitor
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target aarch64-apple-darwin
+
+      - name: Build macOS arm64 desktop app
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: "true"
+        run: |
+          set -euo pipefail
+          set -a
+          source .env.example
+          set +a
+          node scripts/build-desktop-artifact.ts \
+            --platform mac \
+            --target dir \
+            --arch arm64 \
+            --build-version "$VERSION" \
+            --output-dir release
+
+      - name: Write fork app-update.yml
+        shell: bash
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          owner="${GH_REPO%%/*}"
+          repo="${GH_REPO#*/}"
+          cat > "release/mac-arm64/T3 Code (Nightly).app/Contents/Resources/app-update.yml" <<EOF
+          owner: ${owner}
+          repo: ${repo}
+          provider: github
+          releaseType: prerelease
+          channel: nightly
+          updaterCacheDirName: t3code-updater
+          EOF
+
+      - name: Sign macOS app bundle with Developer ID
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/fork-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          p12_path="$RUNNER_TEMP/developer-id.p12"
+          entitlements_path="$RUNNER_TEMP/entitlements.plist"
+
+          printf '%s' "$CSC_LINK" | base64 --decode > "$p12_path"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$p12_path" -P "$CSC_KEY_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security list-keychain -d user -s "$keychain" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain"
+          rm -f "$p12_path"
+
+          identity="$(security find-identity -v -p codesigning "$keychain" | sed -nE 's/.*"([^"]*Developer ID Application[^"]*)".*/\1/p' | head -n 1)"
+          if [[ -z "$identity" ]]; then
+            echo "::error::No 'Developer ID Application' identity found inside CSC_LINK."
+            exit 1
+          fi
+          echo "Signing with: $identity"
+
+          cat > "$entitlements_path" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.automation.apple-events</key>
+            <true/>
+            <key>com.apple.security.cs.allow-jit</key>
+            <true/>
+            <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+            <true/>
+            <key>com.apple.security.cs.disable-library-validation</key>
+            <true/>
+            <key>com.apple.security.device.audio-input</key>
+            <true/>
+            <key>com.apple.security.device.camera</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+          APP_PATH="$GITHUB_WORKSPACE/release/mac-arm64/T3 Code (Nightly).app"
+          (
+            cd scripts
+            APP_PATH="$APP_PATH" SIGN_IDENTITY="$identity" SIGN_KEYCHAIN="$keychain" ENTITLEMENTS_PATH="$entitlements_path" node -e '
+              import("@electron/osx-sign").then(async ({ sign }) => {
+                await sign({
+                  app: process.env.APP_PATH,
+                  identity: process.env.SIGN_IDENTITY,
+                  keychain: process.env.SIGN_KEYCHAIN,
+                  hardenedRuntime: true,
+                  optionsForFile: () => ({ entitlements: process.env.ENTITLEMENTS_PATH }),
+                  batchCodesignCalls: true,
+                });
+              });
+            '
+          )
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+
+      - name: Smoke test signed app
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/smoke-desktop-app.ts \
+            --artifacts-dir "$RUNNER_TEMP/smoke" \
+            --executable "$GITHUB_WORKSPACE/release/mac-arm64/T3 Code (Nightly).app/Contents/MacOS/T3 Code (Nightly)"
+
+      - name: Package zip, dmg, optional notarization, and nightly-mac.yml
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          out_dir="$RUNNER_TEMP/release-assets"
+          mkdir -p "$out_dir"
+
+          app_path="$GITHUB_WORKSPACE/release/mac-arm64/T3 Code (Nightly).app"
+          zip_name="T3-Code-${VERSION}-arm64.zip"
+          dmg_name="T3-Code-${VERSION}-arm64.dmg"
+          zip_path="$out_dir/$zip_name"
+          dmg_path="$out_dir/$dmg_name"
+
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" "$zip_path"
+
+          dmg_stage="$RUNNER_TEMP/dmg-stage"
+          rm -rf "$dmg_stage"
+          mkdir -p "$dmg_stage"
+          ditto "$app_path" "$dmg_stage/T3 Code (Nightly).app"
+          ln -s /Applications "$dmg_stage/Applications"
+          hdiutil create -volname "T3 Code (Nightly)" -srcfolder "$dmg_stage" -ov -format UDZO "$dmg_path"
+          rm -rf "$dmg_stage"
+
+          if [[ -n "${APPLE_API_KEY:-}" && -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER:-}" ]]; then
+            key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+            (umask 077 && printf '%s' "$APPLE_API_KEY" > "$key_path")
+            xcrun notarytool submit "$zip_path" --key "$key_path" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" --wait
+            xcrun notarytool submit "$dmg_path" --key "$key_path" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" --wait
+            xcrun stapler staple "$dmg_path"
+            rm -f "$key_path"
+          else
+            echo "Notarization skipped (APPLE_API_KEY / APPLE_API_KEY_ID / APPLE_API_ISSUER not configured)."
+          fi
+
+          ZIP_PATH="$zip_path" ZIP_NAME="$zip_name" VERSION="$VERSION" MANIFEST_PATH="$out_dir/nightly-mac.yml" node -e '
+            const fs = require("node:fs");
+            const crypto = require("node:crypto");
+            const buf = fs.readFileSync(process.env.ZIP_PATH);
+            const sha512 = crypto.createHash("sha512").update(buf).digest("base64");
+            const size = buf.length;
+            const releaseDate = new Date().toISOString();
+            const yaml = [
+              `version: ${process.env.VERSION}`,
+              "files:",
+              `  - url: ${process.env.ZIP_NAME}`,
+              `    sha512: ${sha512}`,
+              `    size: ${size}`,
+              `path: ${process.env.ZIP_NAME}`,
+              `sha512: ${sha512}`,
+              `releaseDate: '\''${releaseDate}'\''`,
+              "",
+            ].join("\n");
+            fs.writeFileSync(process.env.MANIFEST_PATH, yaml);
+          '
+          cat "$out_dir/nightly-mac.yml"
+
+      - name: Publish GitHub prerelease and update-feed pointer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_NAME: ${{ needs.prepare.outputs.release_name }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          FORK_SHA: ${{ needs.prepare.outputs.fork_sha }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          out_dir="$RUNNER_TEMP/release-assets"
+          notes_path="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes_path" <<EOF
+          Automated fork nightly build combining [\`pingdotgg/t3code@${UPSTREAM_SHA:0:7}\`](https://github.com/pingdotgg/t3code/commit/${UPSTREAM_SHA}) with fork commit \`${FORK_SHA:0:7}\`.
+
+          <!-- fork-build: upstream=${UPSTREAM_SHA} fork=${FORK_SHA} -->
+          EOF
+
+          gh release create "$TAG" \
+            --target "$FORK_SHA" \
+            --draft \
+            --prerelease \
+            --latest=false \
+            --title "$RELEASE_NAME" \
+            --notes-file "$notes_path" \
+            "$out_dir/T3-Code-${VERSION}-arm64.zip" \
+            "$out_dir/T3-Code-${VERSION}-arm64.dmg" \
+            "$out_dir/nightly-mac.yml"
+
+          gh release edit "$TAG" --draft=false
+
+          gh api "repos/$GH_REPO/releases/tags/$TAG" --jq '{tag_name, name, body}' > "$RUNNER_TEMP/nightly.json"
+          gh release view update-feed > /dev/null 2>&1 || \
+            gh release create update-feed --prerelease --latest=false --title "Update feed" \
+              --notes "The desktop updater reads this release to find the newest fork nightly. Do not delete it."
+          gh release upload update-feed "$RUNNER_TEMP/nightly.json" --clobber
+          gh release edit update-feed --draft=false --prerelease --latest=false
+
+      - name: Clean up temporary signing keychain
+        if: always()
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/fork-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/entitlements.plist"
