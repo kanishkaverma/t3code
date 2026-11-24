@@ -158,6 +158,12 @@ update an older server to enable it. Select **Retry** if a search fails. It defa
 `mod+f` outside terminals and previews. Press **Enter** or **Shift+Enter** to move between matches,
 and **Escape** to close find.
 
+## Cite a selection
+
+`chat.citeSelection` cites text selected in an assistant response into the composer, like the
+**Cite** button that appears beside the selection. It defaults to `mod+e` outside terminals and
+previews, and does nothing when no assistant text is selected.
+
 ## Find on a browser page
 
 `preview.find` (`mod+f` while a browser has focus) searches the open page in the desktop app. It

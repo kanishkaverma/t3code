@@ -4,10 +4,13 @@ import {
   type AssistantCitation,
   type ScopedThreadRef,
 } from "@t3tools/contracts";
+import { useAtomValue } from "@effect/atom-react";
 import { useGT } from "gt-react";
 import { QuoteIcon } from "lucide-react";
-import { use, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { use, useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { isCommandPaletteOpen } from "~/commandPaletteBus";
+import { shortcutLabelForCommand } from "~/keybindings";
 import {
   captureAssistantTextSelection,
   type AssistantCitationSourceAnchor,
@@ -18,8 +21,36 @@ import {
   resolveSelectionActionPosition,
   type SelectionActionPoint,
 } from "~/lib/selectionActions";
+import { registerCommands } from "~/shortcuts/dispatcher";
+import { primaryServerKeybindingsAtom } from "~/state/server";
 import { Button } from "../ui/button";
+import { Kbd } from "../ui/kbd";
 import { BackgroundThreadContext } from "./backgroundThread";
+
+function captureCitableSelection(
+  viewport: HTMLElement,
+  threadRef: ScopedThreadRef,
+): {
+  citation: AssistantCitation;
+  sourceAnchor: AssistantCitationSourceAnchor;
+} | null {
+  const captured = captureAssistantTextSelection(viewport, window.getSelection());
+  const messageId = captured?.source.dataset.assistantCitationSource;
+  if (!captured || !messageId) return null;
+  return {
+    sourceAnchor: { source: captured.source, range: captured.range, viewport },
+    citation: {
+      version: 1,
+      ...threadRef,
+      messageId: MessageId.make(messageId),
+      ...captured.selector,
+    },
+  };
+}
+
+function hasOpenModalDialog(): boolean {
+  return document.querySelector('[role="dialog"][aria-modal="true"]') !== null;
+}
 
 export function AssistantSelectionToolbar({
   viewport,
@@ -38,6 +69,7 @@ export function AssistantSelectionToolbar({
   const toolbarRef = useRef<HTMLButtonElement>(null);
   const actionsRef = useRef<ReturnType<typeof observeSelectionActions> | null>(null);
   const backgroundThread = use(BackgroundThreadContext);
+  const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const gt = useGT();
 
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- measures the toolbar DOM node and clamps its position inside the window before paint
@@ -179,18 +211,50 @@ export function AssistantSelectionToolbar({
     };
   }, [backgroundThread, threadRef, viewport]);
 
-  if (!selection) return null;
-  const tooLong = selection.citation.text.length > ASSISTANT_CITATION_MAX_TEXT_LENGTH;
+  const tooLong =
+    selection !== null && selection.citation.text.length > ASSISTANT_CITATION_MAX_TEXT_LENGTH;
   const dismiss = () => {
     actionsRef.current?.cancel();
     setSelection(null);
   };
-  const cite = () => {
-    if (tooLong || !onCite(selection.citation, selection.sourceAnchor)) return false;
+  const citeTarget = (target: {
+    citation: AssistantCitation;
+    sourceAnchor: AssistantCitationSourceAnchor;
+  }) => {
+    if (target.citation.text.length > ASSISTANT_CITATION_MAX_TEXT_LENGTH) return false;
+    if (!onCite(target.citation, target.sourceAnchor)) return false;
     window.getSelection()?.removeAllRanges();
     dismiss();
     return true;
   };
+  const cite = () => (selection ? citeTarget(selection) : false);
+  const citeFromShortcut = useEffectEvent((event: KeyboardEvent) => {
+    if (event.repeat || event.isComposing || !viewport) return false;
+    if (isCommandPaletteOpen() || hasOpenModalDialog()) return false;
+    const target = captureCitableSelection(viewport, threadRef);
+    if (!target || target.citation.text.length > ASSISTANT_CITATION_MAX_TEXT_LENGTH) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    citeTarget(target);
+    return true;
+  });
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- subscribes to the keybinding dispatcher while this foreground timeline is mounted
+  useEffect(() => {
+    if (!viewport || backgroundThread) return;
+    // Capture phase so the focused composer or a message link does not take the chord first.
+    return registerCommands(
+      {
+        "chat.citeSelection": (event) => citeFromShortcut(event),
+      },
+      { capture: true },
+    );
+  }, [backgroundThread, viewport]);
+
+  if (!selection) return null;
+  const shortcutLabel = backgroundThread
+    ? null
+    : shortcutLabelForCommand(keybindings, "chat.citeSelection");
   return createPortal(
     <Button
       ref={toolbarRef}
@@ -215,6 +279,7 @@ export function AssistantSelectionToolbar({
       {tooLong
         ? gt("Shorten selection")
         : gt("Cite", { $context: "verb, button that quotes the selected text" })}
+      {!tooLong && shortcutLabel ? <Kbd>{shortcutLabel}</Kbd> : null}
     </Button>,
     document.body,
   );

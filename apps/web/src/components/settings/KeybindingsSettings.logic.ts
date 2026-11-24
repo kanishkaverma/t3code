@@ -501,6 +501,7 @@ const COMMAND_LABELS: Partial<Record<KeybindingCommand, string>> = {
   "chat.newLocal": msg("Chat: New Local"),
   "chat.newWithoutProject": msg("Chat: New Without Project"),
   "chat.find": msg("Chat: Find"),
+  "chat.citeSelection": msg("Chat: Cite Selection"),
   "editor.openFavorite": msg("Editor: Open Favorite"),
   "modelPicker.toggle": msg("Model Picker: Toggle"),
   "modelPicker.previousProvider": msg("Model Picker: Previous Provider"),
